@@ -1,52 +1,38 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/pricing"
+	"github.com/gocolly/colly"
 )
 
-//Product is a product
-type Product struct {
-	ProductFamily string `json:"productFamily"`
-	Sku           string `json:"sku"`
-	Attributes    map[string]string
-	Terms         Terms `json:"terms"`
+type test interface {
+	cpi() float64
+	getCost() float64
 }
 
-// OnDemand is a thing
-type OnDemand struct {
-	Price float32 `json:"USD"`
+func (i Instance) calcGPI() float64 {
+	//fmt.Println((i.hourlyCost * 750.0) / float64(i.enis) * float64(i.ifaces))
+	return (i.hourlyCost * 750.0) / (float64(i.enis) * float64(i.ifaces))
 }
 
-//Attributes is product attributes
-type Attributes struct {
-	ClockSpeed         string `json:"clockSpeed"`
-	NetworkPerformance string `json:"networkPerformance"`
-	Vcpu               int    `json:"vcpu"`
-}
-
-// Terms is the actual pricing information
-type Terms struct {
-}
-
-func getCost(itype string) float64 {
-	sess := session.Must(session.NewSession(&aws.Config{
-		Region: aws.String("us-east-1"),
-	}))
-	price := pricing.New(sess)
-
+func getCost(price *pricing.Pricing, instance Instance, ch chan Instance, writer *csv.Writer) {
 	pIn := pricing.GetProductsInput{
 		ServiceCode: aws.String("AmazonEC2"),
 		Filters: []*pricing.Filter{
 			&pricing.Filter{
 				Type:  aws.String("TERM_MATCH"),
 				Field: aws.String("instanceType"),
-				Value: aws.String("m5.2xlarge"),
+				Value: aws.String(instance.itype),
 			},
 			&pricing.Filter{
 				Type:  aws.String("TERM_MATCH"),
@@ -71,126 +57,149 @@ func getCost(itype string) float64 {
 			&pricing.Filter{
 				Type:  aws.String("TERM_MATCH"),
 				Field: aws.String("usagetype"),
-				Value: aws.String("USW1-BoxUsage:m5.2xlarge"),
+				Value: aws.String("USE2-BoxUsage:" + instance.itype),
 			},
 		},
 	}
-
+	// fmt.Println(itype)
 	res, err := price.GetProducts(&pIn)
+
 	if err != nil {
-		log.Fatal(err)
+		instance.hourlyCost = 0.0
+		log.Println(err)
 	}
+	if len(res.PriceList) > 0 {
+		var dollas string
 
-	var dollas string
-
-	cost := res.PriceList[0]["terms"].(map[string]interface{})["OnDemand"]
-	for _, c := range cost.(map[string]interface{}) {
-		for _, d := range c.(map[string]interface{})["priceDimensions"].(map[string]interface{}) {
-			dollas = d.(map[string]interface{})["pricePerUnit"].(map[string]interface{})["USD"].(string)
-			break
+		// so ugly, needs refactoring
+		cost := res.PriceList[0]["terms"].(map[string]interface{})["OnDemand"]
+		for _, c := range cost.(map[string]interface{}) {
+			for _, d := range c.(map[string]interface{})["priceDimensions"].(map[string]interface{}) {
+				dollas = d.(map[string]interface{})["pricePerUnit"].(map[string]interface{})["USD"].(string)
+				break
+			}
 		}
-	}
-	hourlyCost, err := strconv.ParseFloat(dollas, 64)
-	return hourlyCost
+		attr := res.PriceList[0]["product"].(map[string]interface{})["attributes"].(map[string]interface{})
+		instance.bandwidth = attr["networkPerformance"].(string)
+		instance.memory = attr["memory"].(string)
+		instance.vcpu, _ = strconv.Atoi(attr["vcpu"].(string))
+		hourlyCost, err := strconv.ParseFloat(dollas, 64)
+		checkError("failed parsing hourly cost", err)
+		instance.hourlyCost = hourlyCost
 
+	} else {
+		instance.hourlyCost = 0.0
+	}
+
+	fmt.Println(instance.itype, instance.enis, instance.ifaces, instance.hourlyCost, instance.calcGPI(), instance.bandwidth, instance.vcpu, instance.memory)
+	//fmt.Println()
+	writeCSV(instance, writer)
+	ch <- instance
 }
 
-type instance struct {
-	vips       int
-	eips       int
+// Instance contains all the data needed to identify the instance cost
+type Instance struct {
+	itype      string
+	ifaces     int
+	enis       int
 	hourlyCost float64
+	cpi        float64
+	bandwidth  string
+	vcpu       int
+	memory     string
+}
+
+func checkError(message string, err error) {
+	if err != nil {
+		log.Fatal(message, err)
+	}
 }
 
 func main() {
-	fmt.Println(getCost("none"))
+	// var wg sync.WaitGroup
 
-	var instanceType map[string]instance
+	file, err := os.Create("result.csv")
+	checkError("Cannot create file", err)
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	err = writer.Write([]string{"Type", "Hourly Cost", "ENI", "EIPs", "Cost/IP/mo", "vCPU", "Memory", "Bandwidth"})
 
-	// b, err := json.MarshalIndent(res.PriceList, "", "  ")
-	// fmt.Println(string(b))
-	// var product Product
+	rate := time.Second / 5
+	throttle := time.Tick(rate)
 
-	// err = json.Unmarshal(b, &product)
-	// if err != nil {
-	// 	log.Fatal(err)
+	ch := make(chan Instance)
+
+	sess := session.Must(session.NewSession(&aws.Config{
+		Region: aws.String("us-east-1"),
+	}))
+
+	price := pricing.New(sess)
+	//var instances []Instance
+
+	c := colly.NewCollector()
+
+	// Find and visit all links
+	c.OnHTML("tbody", func(e *colly.HTMLElement) {
+		e.ForEach("tr", func(i int, tr *colly.HTMLElement) {
+			var instance Instance
+			tr.ForEach("td", func(j int, td *colly.HTMLElement) {
+
+				switch j {
+				case 0:
+					instance.itype = strings.TrimSpace(td.Text)
+				case 1:
+					instance.ifaces, _ = strconv.Atoi(strings.TrimSpace(td.Text))
+				case 2:
+					instance.enis, _ = strconv.Atoi(strings.TrimSpace(td.Text))
+				}
+			})
+			if i > 0 {
+
+				// wg.Add(1)
+				// fmt.Println("calling routines for", instance)
+				<-throttle
+				go getCost(price, instance, ch, writer)
+				// go printChan(ch, &wg)
+			}
+			// var cpi float64
+			// if hourlyCost > 0 {
+			// 	instance.cpi = ((instance.hourlyCost * 750) / (float64(instance.ifaces) * float64(instance.enis)))
+			// 	fmt.Printf("%v: hourly: %f iface: %d eni: %d cpi: %f\n", itype, hourlyCost, ifaces, enis, cpi)
+			// 	err := writer.Write([]string{itype, fmt.Sprintf("%f", hourlyCost), strconv.Itoa(ifaces), strconv.Itoa(enis)})
+			// 	checkError("Error writing csv", err)
+			// } else {
+			// 	cpi = 0
+			// }
+
+		})
+	})
+
+	//fmt.Println(ch)
+	c.Visit("https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html")
+	// fmt.Println(len(instances))
+
+	// for _, i := range instances {
+	// 	// fmt.Println(<-ch)
+	// 	res := (<-ch)
+	// 	spew.Println(res)
+	// 	fmt.Println(i.calcGPI())
 	// }
-	// fmt.Println(product)
-	// fmt.Println(len(res.PriceList))
-	// for k, v := range res.PriceList[0]["product"].(map[string]interface{}) {
 
-	// 	fmt.Println(k, v)
+}
 
-	// 	if k == "attributes" {
-	// 		fmt.Println
-	// 	}
-	// 	// switch val := v.(type) {
-	// 	// case string:
-	// 	// 	fmt.Println(k, "is string", val)
-	// 	// case int:
-	// 	// 	fmt.Println(k, "is int", val)
-	// 	// case []interface{}:
-	// 	// 	fmt.Println(k, "is an array")
-	// 	// 	for i, v := range val {
-	// 	// 		fmt.Println(i, v)
-	// 	// 	}
-	// 	// default:
-	// 	// 	fmt.Println(k, "is unknown type")
-	// 	// }
-	// }
-	// fmt.Println()
-	// for k, v := range res.PriceList[0]["product"].([]string) {
-	// 	fmt.Println(k, v)
-	// }
-	//var p Product
-	// test, err := json.Unmarshal(res.PriceList)
+func writeCSV(i Instance, writer *csv.Writer) {
+	// file, err := os.Create("result.csv")
+	// checkError("Cannot create file", err)
+	// defer file.Close()
 
-	// fmt.Println(test)
+	defer writer.Flush()
 
-	// aws.jsonutil
-	// var f interface{}
-	// _ = json.Unmarshal([]byte(res.PriceList[0]["product"]), &f)
-	//json.Marshal
+	err := writer.Write([]string{i.itype, fmt.Sprintf("%f", i.hourlyCost), strconv.Itoa(i.ifaces), strconv.Itoa(i.enis), fmt.Sprintf("%f", i.calcGPI()), strconv.Itoa(i.vcpu), i.memory, i.bandwidth})
+	checkError("Error writing csv", err)
 
-	// fmt.Println(len(res.PriceList))
-	// fmt.Printf("%T\n", res.PriceList[0]["product"])
+}
 
-	// t := res.PriceList[0]["product"].([]byte)
-
-	// aws.JSONValue
-
-	// _ =
-
-	// for _, num := range res.PriceList {
-
-	// }
-	// fmt.Println(len(res.PriceList))
-
-	// c := colly.NewCollector()
-
-	// // Find and visit all links
-	// c.OnHTML("tbody", func(e *colly.HTMLElement) {
-	// 	e.ForEach("tr", func(i int, tr *colly.HTMLElement) {
-	// 		var itype string
-	// 		var ifaces, enis int
-
-	// 		tr.ForEach("td", func(j int, td *colly.HTMLElement) {
-
-	// 			switch j {
-	// 			case 0:
-	// 				itype = strings.TrimSpace(td.Text)
-	// 			case 1:
-	// 				ifaces, _ = strconv.Atoi(strings.TrimSpace(td.Text))
-	// 			case 2:
-	// 				enis, _ = strconv.Atoi(strings.TrimSpace(td.Text))
-	// 			}
-	// 		})
-	// 		if i > 0 {
-	// 			maxIps := ifaces * enis
-	// 			fmt.Println(itype, maxIps)
-	// 		}
-
-	// 	})
-	// })
-
-	// c.Visit("https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html")
+func printChan(ch chan Instance) {
+	res := (<-ch)
+	fmt.Println(res)
 }
