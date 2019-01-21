@@ -159,39 +159,16 @@ func main() {
 				// fmt.Println("calling routines for", instance)
 				<-throttle
 				go getCost(price, instance, ch, writer)
-				// go printChan(ch, &wg)
+
 			}
-			// var cpi float64
-			// if hourlyCost > 0 {
-			// 	instance.cpi = ((instance.hourlyCost * 750) / (float64(instance.ifaces) * float64(instance.enis)))
-			// 	fmt.Printf("%v: hourly: %f iface: %d eni: %d cpi: %f\n", itype, hourlyCost, ifaces, enis, cpi)
-			// 	err := writer.Write([]string{itype, fmt.Sprintf("%f", hourlyCost), strconv.Itoa(ifaces), strconv.Itoa(enis)})
-			// 	checkError("Error writing csv", err)
-			// } else {
-			// 	cpi = 0
-			// }
 
 		})
 	})
 
-	//fmt.Println(ch)
 	c.Visit("https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html")
-	// fmt.Println(len(instances))
-
-	// for _, i := range instances {
-	// 	// fmt.Println(<-ch)
-	// 	res := (<-ch)
-	// 	spew.Println(res)
-	// 	fmt.Println(i.calcGPI())
-	// }
-
 }
 
 func writeCSV(i Instance, writer *csv.Writer) {
-	// file, err := os.Create("result.csv")
-	// checkError("Cannot create file", err)
-	// defer file.Close()
-
 	defer writer.Flush()
 
 	err := writer.Write([]string{i.itype, fmt.Sprintf("%f", i.hourlyCost), strconv.Itoa(i.ifaces), strconv.Itoa(i.enis), fmt.Sprintf("%f", i.calcGPI()), strconv.Itoa(i.vcpu), i.memory, i.bandwidth})
